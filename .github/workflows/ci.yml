@@ -9,9 +9,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-linux:
-    name: Test (Linux)
-    runs-on: ubuntu-latest
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
 
     steps:
       - name: Checkout
@@ -23,7 +30,8 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Install Kopia
+      - name: Install Kopia on Linux
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -33,6 +41,35 @@ jobs:
           sudo install /tmp/kopia-${KOPIA_VERSION}-linux-x64/kopia /usr/local/bin/kopia
           kopia --version
 
-      - name: Run tests
+      - name: Install Kopia on macOS
+        if: runner.os == 'macOS'
         shell: bash
+        run: |
+          set -euo pipefail
+          KOPIA_VERSION=0.22.3
+          curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-macOS-universal.tar.gz"
+          tar -xzf /tmp/kopia.tar.gz -C /tmp
+          sudo install /tmp/kopia-${KOPIA_VERSION}-macOS-universal/kopia /usr/local/bin/kopia
+          kopia --version
+
+      - name: Install Kopia on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '0.22.3'
+          $zipPath = Join-Path $env:RUNNER_TEMP 'kopia.zip'
+          $extractPath = Join-Path $env:RUNNER_TEMP 'kopia'
+          Invoke-WebRequest -Uri "https://github.com/kopia/kopia/releases/download/v$version/kopia-$version-windows-x64.zip" -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          "$extractPath\kopia-$version-windows-x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          kopia --version
+
+      - name: Run tests on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: go test ./...
+
+      - name: Run tests on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: go test ./...
