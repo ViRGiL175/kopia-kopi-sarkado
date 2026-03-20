@@ -1,0 +1,1 @@
+# kopia-kopi-sarkado
