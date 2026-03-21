@@ -7,14 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/app"
 	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/kopia"
-	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/planner"
 	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/storage"
 )
 
@@ -84,62 +82,13 @@ func TestPreflightIntegrationReadyWithoutDeletion(t *testing.T) {
 	}
 }
 
-func TestPreflightIntegrationWithRealKopiaRepo(t *testing.T) {
+func TestPreflightIntegrationSkipsDeletionWhenTargetIsHeuristicallyImpossible(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := integrationContext(t)
 	defer cancel()
 
 	env := setupIntegrationEnv(t, ctx, 6)
-
-	result, code, err := app.RunPreflight(ctx, os.Stdout, app.Config{
-		Source:             env.sourceDir,
-		SpacePath:          env.repoDir,
-		KopiaBinary:        "kopia",
-		KopiaConfigFile:    env.configFile,
-		KopiaPassword:      env.password,
-		MaxPasses:          2,
-		BatchSize:          1,
-		KeepLatest:         1,
-		EstimateMultiplier: 1,
-		ServiceReserve:     0,
-		SafetyMargin:       env.beforeFree + impossibleSafetyMargin,
-		RunMaintenance:     false,
-		MaintenanceMode:    "quick",
-		Apply:              true,
-	})
-	if err != nil {
-		t.Fatalf("RunPreflight() error = %v", err)
-	}
-
-	if code != app.ExitInsufficientSpace {
-		t.Fatalf("RunPreflight() code = %d, want %d", code, app.ExitInsufficientSpace)
-	}
-
-	if len(result.DeletedIDs) == 0 {
-		t.Fatal("expected preflight to delete at least one snapshot")
-	}
-
-	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() after preflight error = %v", err)
-	}
-
-	if len(afterSnapshots) >= len(env.before) {
-		t.Fatalf("expected fewer snapshots after preflight, before=%d after=%d", len(env.before), len(afterSnapshots))
-	}
-	if result.ReadyForBackup {
-		t.Fatal("expected backup to remain blocked in integration test")
-	}
-}
-
-func TestPreflightIntegrationStopsAtRetentionFloorWhenStillInsufficient(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := integrationContext(t)
-	defer cancel()
-
-	env := setupIntegrationEnv(t, ctx, 5)
 
 	result, code, err := app.RunPreflight(ctx, os.Stdout, app.Config{
 		Source:             env.sourceDir,
@@ -165,30 +114,26 @@ func TestPreflightIntegrationStopsAtRetentionFloorWhenStillInsufficient(t *testi
 		t.Fatalf("RunPreflight() code = %d, want %d", code, app.ExitInsufficientSpace)
 	}
 	if result.ReadyForBackup {
-		t.Fatal("expected backup to remain blocked when even all candidates are exhausted")
+		t.Fatal("expected backup to remain blocked when pruning is heuristically impossible")
+	}
+	if len(result.DeletedIDs) != 0 {
+		t.Fatalf("expected no deletions for heuristically impossible target, got %d", len(result.DeletedIDs))
+	}
+	if result.PassesExecuted != 0 {
+		t.Fatalf("expected zero passes executed for heuristically impossible target, got %d", result.PassesExecuted)
+	}
+	if result.FreeBytes+result.MaxReclaimable >= result.RequiredBytes {
+		t.Fatalf("expected optimistic reclaim to stay below required headroom, free=%d reclaim=%d required=%d", result.FreeBytes, result.MaxReclaimable, result.RequiredBytes)
 	}
 
 	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
 	if err != nil {
 		t.Fatalf("ListSnapshots() after preflight error = %v", err)
 	}
-
-	keptIDs := snapshotIDs(result.Plan.Kept)
-	afterIDs := snapshotIDsFromSnapshots(afterSnapshots)
-
-	if len(afterSnapshots) != len(result.Plan.Kept) {
-		t.Fatalf("expected preflight to stop at retention floor, kept=%d after=%d", len(result.Plan.Kept), len(afterSnapshots))
-	}
-	if len(result.DeletedIDs)+len(afterSnapshots) != len(env.before) {
-		t.Fatalf("expected deleted + kept to match original snapshots, before=%d deleted=%d after=%d", len(env.before), len(result.DeletedIDs), len(afterSnapshots))
-	}
-	for _, id := range keptIDs {
-		if !slices.Contains(afterIDs, id) {
-			t.Fatalf("expected kept snapshot %s to remain after preflight", id)
-		}
+	if len(afterSnapshots) != len(env.before) {
+		t.Fatalf("expected snapshot count to stay unchanged, before=%d after=%d", len(env.before), len(afterSnapshots))
 	}
 }
-
 func TestPreflightIntegrationLargeDataset(t *testing.T) {
 	ctx, cancel := integrationContextWithTimeout(t, 10*time.Minute)
 	defer cancel()
@@ -421,22 +366,6 @@ func runKopia(t *testing.T, ctx context.Context, password string, args ...string
 	}
 
 	return string(output)
-}
-
-func snapshotIDs(decisions []planner.Decision) []string {
-	ids := make([]string, 0, len(decisions))
-	for _, decision := range decisions {
-		ids = append(ids, decision.Snapshot.ID)
-	}
-	return ids
-}
-
-func snapshotIDsFromSnapshots(snapshots []kopia.Snapshot) []string {
-	ids := make([]string, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		ids = append(ids, snapshot.ID)
-	}
-	return ids
 }
 
 func mustMkdirAll(t *testing.T, path string) {

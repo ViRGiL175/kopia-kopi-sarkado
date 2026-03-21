@@ -13,9 +13,10 @@ Cross-platform Go CLI for Kopia preflight checks and logarithmic snapshot thinni
 2. Computes required headroom as `estimate * multiplier + service_reserve + safety_margin`.
 3. Reads snapshot history via `kopia snapshot list --json`.
 4. Builds a logarithmic pruning plan.
-5. In `preflight` mode, deletes snapshots in batches between passes.
-6. Re-measures actual free space after each pass.
-7. Fails if the target headroom is still not reached after `max-passes`.
+5. In `preflight` mode, fails early if even optimistic full pruning still cannot reach the target headroom.
+6. Otherwise, deletes snapshots in batches between passes.
+7. Re-measures actual free space after each pass.
+8. Fails if the target headroom is still not reached after `max-passes`.
 
 ## Estimate
 
@@ -82,15 +83,18 @@ The tool always preserves:
 Everything else becomes a deletion candidate.
 
 The tool does not delete beyond that retention floor.
+If `free_space + optimistic_reclaimable_headroom` is still below the target, preflight aborts before deleting anything.
 If all candidates are exhausted and there is still not enough space, preflight fails and the backup stays blocked.
 
 ## Integration Tests
 
 The project includes real integration tests against a temporary Kopia filesystem repository.
+Low-space scenarios use an injected free-space probe so snapshot operations stay real while the available-space behavior remains deterministic.
 
 1. Positive path: enough free space already exists, so backup is allowed and nothing is deleted.
-2. Negative path: some snapshots are deleted, but free space is still insufficient, so backup remains blocked.
-3. Retention-floor path: all disposable candidates are exhausted, but protected snapshots are still preserved and backup remains blocked.
+2. Early-impossible path: even optimistic full pruning is insufficient, so nothing is deleted and backup remains blocked.
+3. Bounded-pass path: some snapshots are deleted, but `max-passes` is reached first, so backup remains blocked.
+4. Retention-floor path: all disposable candidates are exhausted, but protected snapshots are still preserved and backup remains blocked.
 
 ## How To Integrate With The Kopia Scheduler
 
