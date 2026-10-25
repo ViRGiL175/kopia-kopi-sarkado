@@ -313,7 +313,8 @@ func TestLinuxKillAfterKopiaSuccessBeforeJournalResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Count(journal, []byte(`"event":"delete-intent"`)) != 1 || bytes.Contains(journal, []byte("delete-confirmed")) || bytes.Contains(journal, []byte(`"event":"finished"`)) {
+	events := checkSingleIntent(t, journal, completed.ID)
+	if len(events) != 2 || events[0].Event != "operation" || events[1].Event != "delete-intent" {
 		t.Fatalf("not in the intended unrecorded-result window: %s", journal)
 	}
 	if err := process.command.Process.Kill(); err != nil {
@@ -345,4 +346,32 @@ func TestLinuxKillAfterKopiaSuccessBeforeJournalResult(t *testing.T) {
 		r.Restore(s, fmt.Sprintf("synthetic version %d\n", s.EndTime.Minute()))
 	}
 	t.Logf("SIGKILL after native success: exactly %s absent; one intent without result; retry refused", completed.ID)
+}
+
+type recordedEvent struct {
+	Event string `json:"event"`
+	ID    string `json:"id"`
+}
+
+func checkSingleIntent(t *testing.T, journal []byte, id string) []recordedEvent {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(journal))
+	var events []recordedEvent
+	var intents []string
+	for {
+		var event recordedEvent
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("invalid operation journal: %v", err)
+		}
+		events = append(events, event)
+		if event.Event == "delete-intent" {
+			intents = append(intents, event.ID)
+		}
+	}
+	if !slices.Equal(intents, []string{id}) {
+		t.Fatalf("journal intents %v differ from the one requested ID %s", intents, id)
+	}
+	return events
 }

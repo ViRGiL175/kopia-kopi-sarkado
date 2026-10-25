@@ -117,27 +117,33 @@ func fillTestVolume(t *testing.T, volume string) string {
 			t.Errorf("remove test filler: %v", err)
 		}
 	})
-	data := make([]byte, 1<<20)
+	// fallocate reserves actual blocks synchronously. A large buffered write can
+	// return ENOSPC while leaving enough space for a small Kopia metadata write.
+	var offset int64
 	exhausted := false
-	for written := int64(0); written <= testImageBytes; written += int64(len(data)) {
-		_, err = file.Write(data)
-		if err == nil {
-			err = file.Sync()
-		}
-		if errors.Is(err, syscall.ENOSPC) {
-			exhausted = true
-			break
-		}
-		if err != nil {
-			_ = file.Close()
-			t.Fatal(err)
+	for _, chunk := range []int64{1 << 20, 4096} {
+		for offset+chunk <= testImageBytes {
+			err = syscall.Fallocate(int(file.Fd()), 0, offset, chunk)
+			if errors.Is(err, syscall.ENOSPC) {
+				exhausted = true
+				break
+			}
+			if err != nil {
+				_ = file.Close()
+				t.Fatal(err)
+			}
+			offset += chunk
 		}
 	}
 	closeErr := file.Close()
 	if !exhausted || (closeErr != nil && !errors.Is(closeErr, syscall.ENOSPC)) {
 		t.Fatalf("bounded filler did not reach ENOSPC: %v", closeErr)
 	}
-	t.Log("confirmed ENOSPC on the isolated 256MiB loop filesystem")
+	var stats syscall.Statfs_t
+	if err := syscall.Statfs(volume, &stats); err != nil || stats.Bavail != 0 {
+		t.Fatalf("full-volume fixture still has available blocks: %d, error %v", stats.Bavail, err)
+	}
+	t.Log("confirmed ENOSPC and zero available blocks on the isolated 256MiB loop filesystem")
 	return path
 }
 
@@ -163,14 +169,15 @@ func TestLinuxFullRepositoryVolumeBlocksPruningAndPreservesCopies(t *testing.T) 
 		t.Fatalf("full repository mutation must fail closed: code=%d error=%v", code, err)
 	}
 	journal, journalErr := os.ReadFile(cfg.OperationFile)
-	if journalErr != nil || bytes.Count(journal, []byte(`"event":"delete-intent"`)) != 1 {
-		t.Fatalf("failed operation must stop after one intent: %v %s", journalErr, journal)
+	if journalErr != nil {
+		t.Fatal(journalErr)
 	}
+	attempted := result.Plan.Candidates[0].Snapshot.ID
+	checkSingleIntent(t, journal, attempted)
 	if err := os.Remove(filler); err != nil {
 		t.Fatal(err)
 	}
 	after := snapshotIDs(r.Snapshots())
-	attempted := result.Plan.Candidates[0].Snapshot.ID
 	for _, s := range before {
 		if !slices.Contains(after, s.ID) {
 			if s.ID != attempted {
@@ -231,6 +238,11 @@ func TestLinuxNormalMaintenanceDelayAndIsolatedReclamation(t *testing.T) {
 		}
 		destination := filepath.Join(r.Root, "not-yet-reclaimed-"+id)
 		r.Run("snapshot", "restore", originals[id].RootEntry.ObjectID, destination)
+		// An object-ID restore has no original root mode; Kopia makes it read-only.
+		// This private directory must remain removable by the fixture cleanup.
+		if err := os.Chmod(destination, 0o700); err != nil {
+			t.Fatal(err)
+		}
 		data, err := os.ReadFile(filepath.Join(destination, "payload.bin"))
 		if err != nil || sha256.Sum256(data) != hashes[id] {
 			t.Fatal("normal safety unexpectedly discarded young content")
@@ -251,15 +263,32 @@ func TestLinuxNormalMaintenanceDelayAndIsolatedReclamation(t *testing.T) {
 	if testVolume(t) != volume || filepath.Dir(r.Storage) != volume {
 		t.Fatal("reclamation fixture lost isolation")
 	}
-	r.Run("maintenance", "run", "--full", "--safety=none")
-	r.Run("maintenance", "run", "--full", "--safety=none")
-	afterReclaim, err := r.Client.Status(r.Context)
-	if err != nil {
-		t.Fatal(err)
+	// Native content timestamps have one-second resolution and advance
+	// monotonically on rewrites. Immediate back-to-back cycles need not reclaim
+	// their packs yet. Poll a measured outcome with a fixed small cycle budget;
+	// no more manifests are deleted and no repository clock is changed.
+	var reclaimed int64
+	var maintenanceOutput strings.Builder
+	for cycle := 0; cycle < 6; cycle++ {
+		if cycle > 0 {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-r.Context.Done():
+				t.Fatal(r.Context.Err())
+			}
+		}
+		maintenanceOutput.WriteString(r.Run("maintenance", "run", "--full", "--safety=none"))
+		afterReclaim, err := r.Client.Status(r.Context)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reclaimed = afterReclaim.FreeBytes() - beforeReclaim.FreeBytes()
+		if reclaimed >= 2<<20 {
+			break
+		}
 	}
-	reclaimed := afterReclaim.FreeBytes() - beforeReclaim.FreeBytes()
 	if reclaimed < 2<<20 {
-		t.Fatalf("expected physical reclamation of unique 4MiB content, got %d bytes", reclaimed)
+		t.Fatalf("expected physical reclamation of unique 4MiB content, got %d bytes\n%s", reclaimed, maintenanceOutput.String())
 	}
 	remaining := r.Snapshots()
 	if !slices.Equal(snapshotIDs(afterNormal), snapshotIDs(remaining)) {
