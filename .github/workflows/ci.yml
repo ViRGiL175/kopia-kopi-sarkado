@@ -12,6 +12,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      KKS_INTEGRATION: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +38,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          KOPIA_VERSION=0.22.3
+          KOPIA_VERSION=0.23.1
           curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
           tar -xzf /tmp/kopia.tar.gz -C /tmp
           sudo install /tmp/kopia-${KOPIA_VERSION}-linux-x64/kopia /usr/local/bin/kopia
@@ -46,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          KOPIA_VERSION=0.22.3
+          KOPIA_VERSION=0.23.1
           curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-macOS-universal.tar.gz"
           tar -xzf /tmp/kopia.tar.gz -C /tmp
           sudo install /tmp/kopia-${KOPIA_VERSION}-macOS-universal/kopia /usr/local/bin/kopia
@@ -56,7 +59,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = '0.22.3'
+          $version = '0.23.1'
           $zipPath = Join-Path $env:RUNNER_TEMP 'kopia.zip'
           $extractPath = Join-Path $env:RUNNER_TEMP 'kopia'
           Invoke-WebRequest -Uri "https://github.com/kopia/kopia/releases/download/v$version/kopia-$version-windows-x64.zip" -OutFile $zipPath
@@ -71,9 +74,9 @@ jobs:
       - name: Run tests on Unix
         if: runner.os != 'Windows'
         shell: bash
-        run: go test ./...
+        run: go test -count=1 -v -timeout=10m ./...
 
       - name: Run tests on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: go test ./...
+        run: go test -count=1 -v -timeout=10m ./...

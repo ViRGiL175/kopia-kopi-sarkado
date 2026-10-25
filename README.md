@@ -7,147 +7,115 @@ Cross-platform Go CLI for Kopia preflight checks and logarithmic snapshot thinni
 > It is not my primary project, not my usual stack, and I do not have the time to maintain it as a long-term product.
 > The feature still matters, so the repository is intentionally small and test-driven.
 
-## MVP
+## Supported operation
 
-1. Uses `kopia snapshot estimate` as a heuristic for the next snapshot size.
-2. Computes required headroom as `estimate * multiplier + service_reserve + safety_margin`.
-3. Reads snapshot history via `kopia snapshot list --json`.
-4. Builds a logarithmic pruning plan.
-5. In `preflight` mode, fails early if even optimistic full pruning still cannot reach the target headroom.
-6. Otherwise, deletes snapshots in batches between passes.
-7. Re-measures actual free space after each pass.
-8. Fails if the target headroom is still not reached after `max-passes`.
+The tool estimates the next backup, reads the exact source's snapshot history, and automatically prunes surplus snapshots when explicitly authorized. It does not deduplicate files or prove that two snapshots contain equivalent data.
 
-## Estimate
+This build requires **Kopia CLI 0.23.1** and a **direct filesystem repository**. Remote object storage and repository-server connections are rejected: their capacity cannot safely be inferred from local free disk space. Source and configuration paths must be absolute. Free bytes come from Kopia's repository status, for the connected storage.
 
-`kopia snapshot estimate` is useful for preflight logic, but it is not a guaranteed upper bound.
+`snapshot estimate` reports logical source size. Required headroom is `ceil(estimate * multiplier) + service_reserve + safety_margin`, with checked arithmetic. This remains a heuristic, not a promise that the backup will fit. A target above the actual total storage capacity blocks backup without deletion. Deleting manifests does not immediately free their content; the tool makes no reclaimable-byte prediction.
 
-1. It must not be treated as the exact amount of space that must be freed.
-2. The stop condition must be based on measured free space after each pass.
-3. Deleting snapshots does not guarantee proportional space reclamation because of deduplication and maintenance behavior.
-
-## Why Go And Why An External CLI
-
-1. Go gives a single binary across platforms.
-2. Kopia does not expose a convenient plugin model for this kind of pruning engine.
-3. An external CLI is easier to integrate, test, and run as a pre-hook.
-4. Integration stays on top of the supported Kopia CLI instead of patching Kopia itself.
-
-## Implemented Commands
-
-### `plan`
-
-Builds a pruning plan and reports the required headroom without deleting snapshots.
-
-Example:
+## Read-only preview
 
 ```sh
-go run . plan --source /data/source --space-path /repo
+go run . plan --source /data/source --config-file /config/test.config
+go run . preflight --source /data/source --config-file /config/test.config
 ```
 
-### `preflight`
+Both commands default to no deletion. The complete report contains repository ID, exact source identity, every kept and candidate manifest ID, protection reasons, headroom, deletion budget, and maintenance scope. `plan` returns zero for a successfully produced plan even when headroom is insufficient; **never use `plan` as a backup gate**. `preflight` returns 2 for insufficient space.
 
-Runs the pruning loop until the safe threshold is reached or the command fails.
+Preview scans the specified source and reads repository metadata; Kopia may use its local cache. It does not create a backup, expire snapshots, or run maintenance.
 
-Example:
+## Automatic pruning
+
+For a disposable test repository with externally serialized access:
 
 ```sh
-go run . preflight --source /data/source --space-path /repo --max-passes 3 --batch-size 2 --run-maintenance
+go run . preflight \
+  --source /data/source --config-file /config/test.config \
+  --apply --repository-id ID_FROM_PREVIEW --exclusive-access \
+  --operation-file /state/kopia-pruning-operation.jsonl \
+  --max-passes 3 --batch-size 2
 ```
 
-## Main Flags
+`--exclusive-access` confirms an operational prerequisite: **all writers, policy/pin editors, other pruning tools, and maintenance processes must be serialized externally for the entire preflight and subsequent backup**. The flag does not acquire a distributed lock. Kopia's separate CLI reads and explicit deletes do not provide an atomic compare-and-delete transaction. Revalidation detects observed changes; it cannot eliminate a change between the last check and deletion. Do not enable apply where exclusive access cannot be enforced.
 
-1. `--source` path of the source already backed up by Kopia.
-2. `--space-path` path on the same filesystem where free space should be measured.
-3. `--password` repository password when it is not stored in config or a credential manager.
-4. `--estimate-multiplier` multiplier applied on top of the estimate.
-5. `--safety-margin` extra headroom, for example `1GiB`.
-6. `--service-reserve` reserve for Kopia metadata and temporary writes.
-7. `--max-passes` maximum number of pruning passes.
-8. `--batch-size` number of snapshots deleted per pass.
-9. `--keep-latest` number of newest snapshots that are never touched.
-10. `--run-maintenance` whether maintenance should run after each pass.
-11. `--maintenance-mode` `quick` or `full`.
-12. `--protect-tag` snapshot tag that must never be deleted, format `key=value`.
+The operation file must be on durable, trusted storage, outside the source and repository storage, with an existing private parent directory. It is created exclusively and never overwritten. The tool syncs the initial candidate/keep lists and budget, then each deletion intent and observed outcome. Protect the parent directory with OS permissions; on Windows the file inherits its directory ACL.
 
-## Pruning Logic
+Use the **same operation path on every retry**. Any existing file blocks apply, including an interrupted or completed operation. Inspect the journal and actual repository state before a new operation. Never delete or rotate it automatically on failure, and never generate a fresh path for every scheduler retry. Rotate only after explicitly resolving the prior operation and confirming a successful backup. A read-only `preflight` can assess current headroom while the old journal remains.
 
-The tool always preserves:
+One invocation deletes at most `max-passes * batch-size` of the originally listed candidates. Before each delete it rechecks repository identity, inventory, and current protection. It stops on cancellation, an unexpected inventory change, an error, an uncertain outcome, exhausted budget, or a batch with no measured free-space gain. It never expands the candidate set during an operation.
 
-1. The oldest snapshot.
-2. The newest snapshot.
-3. The latest `N` snapshots.
-4. Snapshots with protected tags.
-5. One representative snapshot per logarithmic age bucket.
+A nonzero CLI result may follow a committed deletion. The tool queries the repository again and reports confirmed deletions separately from unknown outcomes. An intent without a confirmed outcome after a crash requires inspection. The journal is a retry guard and audit trail, **not an undo log**. Durability still depends on the filesystem and hardware; abrupt power-loss behavior is not certified.
 
-Everything else becomes a deletion candidate.
+## What is preserved
 
-The tool does not delete beyond that retention floor.
-If `free_space + optimistic_reclaimable_headroom` is still below the target, preflight aborts before deleting anything.
-If all candidates are exhausted and there is still not enough space, preflight fails and the backup stays blocked.
+Planning is scoped to the exact Kopia `host + userName + path` tuple. Ancestor sources returned by Kopia's path filter are excluded. Paths are not case-folded, Unicode-normalized, or merged through symlinks/hardlinks. If the same directory has multiple source identities, each is separate.
 
-## Integration Tests
+The tool preserves:
 
-The project includes real integration tests against a temporary Kopia filesystem repository.
-Low-space scenarios use an injected free-space probe so snapshot operations stay real while the available-space behavior remains deterministic.
+- Every snapshot protected by native Kopia retention reasons or pins.
+- Incomplete, errored, ignored-error, or insufficiently described snapshots.
+- The oldest complete snapshot, newest complete snapshot, and latest N complete snapshots.
+- Snapshots matching a protected tag.
+- A representative in each logarithmic age bucket, plus ties at the latest timestamp.
 
-1. Positive path: enough free space already exists, so backup is allowed and nothing is deleted.
-2. Early-impossible path: even optimistic full pruning is insufficient, so nothing is deleted and backup remains blocked.
-3. Bounded-pass path: some snapshots are deleted, but `max-passes` is reached first, so backup remains blocked.
-4. Retention-floor path: all disposable candidates are exhausted, but protected snapshots are still preserved and backup remains blocked.
+Incomplete snapshots do not satisfy the complete-snapshot floor. Metadata marked complete is not proof of readable content: periodically restore retained versions independently. Neither source files nor individual objects are directly deleted by this tool.
 
-## How To Integrate With The Kopia Scheduler
+## Maintenance and recovery
 
-The intended integration is a pre-hook via `before-snapshot-root-action`.
+Every subprocess disables Kopia's automatic maintenance, local file/content logging, and ordinary repository logging. Without `--run-maintenance`, manifest deletion is the only requested repository mutation.
 
-Flow:
+`--run-maintenance --maintenance-mode quick|full` explicitly authorizes native Kopia maintenance after each batch. The client must already be the configured maintenance owner; the tool does not change ownership or schedules. Maintenance is **repository-wide**, including content unrelated to this source. Native maintenance explicitly enables its repository log manager even when ordinary repository logging is disabled; its logs and metadata are additional authorized writes. Its intent and success/uncertainty are journaled. No unsafe timing override or forced garbage collection is used.
 
-1. Kopia scheduler starts a snapshot job.
-2. `before-snapshot-root-action` runs `kopia-kopi-sarkado preflight ...`.
-3. If the command returns `0`, the backup proceeds.
-4. If the command returns a non-zero exit code, the backup does not start.
+Kopia's normal safety delays can prevent immediate reclamation even after full maintenance. If headroom remains insufficient, the backup stays blocked. Recover capacity separately; repeatedly deleting more recovery points is not a substitute for capacity planning. Deleted snapshots have no guaranteed undelete path, and maintenance can make their content unrecoverable. Test restoration before enabling pruning and maintain independent recovery copies.
 
-Practical notes:
+## Flags and migration
 
-1. Use `essential` action mode.
-2. Set `action-command-timeout` high enough for the preflight duration.
-3. Keep the pruning loop bounded for large repositories.
+- `--source`, `--config-file`: required absolute paths.
+- `--kopia-bin`: executable, resolved once; use a trusted absolute path for automation.
+- `--apply`, `--repository-id`, `--exclusive-access`, `--operation-file`: required together to authorize pruning.
+- `--keep-latest`: complete snapshot floor, default 3, positive.
+- `--max-passes`, `--batch-size`: defaults 3 and 2, each 1–100.
+- `--estimate-multiplier`: finite and at least 1, default 1.25.
+- `--service-reserve`, `--safety-margin`: default 512MiB and 1GiB.
+- `--protect-tag`: repeatable exact JSON tag key/value, e.g. `--protect-tag tag:important=yes` for a Kopia `--tags important:yes` tag.
+- `--run-maintenance`, `--maintenance-mode`: opt-in repository-wide maintenance, mode defaults to quick.
 
-## MVP Limitations
+**Existing invocations must be updated.** Preflight no longer implicitly authorizes deletion. `--space-path` was removed to prevent checking an unrelated disk. `--password` was removed to avoid passwords in process arguments; use Kopia's configured credential mechanism or a scoped `KOPIA_PASSWORD` environment variable. Do not put credentials in shared scripts or logs. CLI errors omit subprocess output and arguments, and output capture is bounded.
 
-1. Free-space measurement currently requires a local `--space-path`.
-2. The tool works through the Kopia CLI, not through Kopia internal APIs.
-3. `snapshot estimate` is only a heuristic.
-4. Space reclamation after deletion is probabilistic, not guaranteed.
+Exit codes: 0 ready (or a successful plan), 2 insufficient space, 3 invalid configuration, 4 runtime failure or uncertain outcome. The CLI has a 30-minute deadline and handles Ctrl+C cancellation. Any nonzero preflight result must block the backup.
 
-## Project Structure
+## Scheduler integration
 
-1. [main.go](main.go) entry point.
-2. [internal/cli/cli.go](internal/cli/cli.go) command and flag parsing.
-3. [internal/app/preflight.go](internal/app/preflight.go) preflight logic and pruning loop.
-4. [internal/kopia/client.go](internal/kopia/client.go) Kopia CLI calls.
-5. [internal/planner/planner.go](internal/planner/planner.go) logarithmic planner.
-6. [internal/storage/free_windows.go](internal/storage/free_windows.go) and [internal/storage/free_unix.go](internal/storage/free_unix.go) free-space measurement.
-7. [internal/estimate/parse.go](internal/estimate/parse.go) parsing for `snapshot estimate` output.
-8. [internal/units/bytes.go](internal/units/bytes.go) size parsing and formatting.
-9. [integration_test.go](integration_test.go) real end-to-end tests with a temporary Kopia repository.
+Use `before-snapshot-root-action` in essential mode, with a timeout that covers the preflight deadline. Configure and test actions separately; this program does not enable them or modify schedules. The source path must match Kopia's recorded identity, including when a snapshot action remaps paths.
 
-## Development
+Keep exclusive access through the subsequent backup. Persist the operation path across failed attempts. A successful preflight only establishes measured headroom at that instant; new source data or other filesystem users can still exhaust it. Start with read-only runs and verify successful restoration from a disposable repository before authorizing writes.
 
-Build:
+## Development and verification
 
 ```sh
 go build ./...
-```
-
-Test:
-
-```sh
 go test ./...
 ```
 
-## CI
+Without `KKS_INTEGRATION=1`, real integration tests explicitly skip; this is **not** a full safety check. To run them with Kopia 0.23.1 on an isolated runner:
 
-1. Pull requests.
-2. Manual `workflow_dispatch` runs.
-3. `act`, using the Linux job locally.
+```sh
+KKS_INTEGRATION=1 go test -count=1 -v -timeout=10m ./...
+```
+
+PowerShell:
+
+```powershell
+$env:KKS_INTEGRATION = '1'
+go test -count=1 -v -timeout=10m ./...
+```
+
+Optionally set `KKS_KOPIA_BINARY` to the absolute executable path. With integration enabled, missing Kopia fails the suite. Tests create disposable local repositories and synthetic files with separate config, password, home, cache, and temporary directories, and no inherited Kopia environment. Credential persistence and snapshot actions are disabled. No existing repository is used. Use isolated CI runners or a disposable machine; the test processes are not an OS sandbox.
+
+The suite exercises real retention JSON, pins, nested sources, incomplete uploads, dry-run, bounded application, restoration of retained versions, Unicode paths, hardlinks, symlinks on Unix, maintenance opt-in, concurrent pin changes, cancellation after partial success, and retry refusal. Arithmetic and argument validation use focused unit tests. No fake Kopia implementation is present.
+
+A requested reserve above current free bytes but below total capacity exercises insufficient-headroom behavior without filling the disk. An impossible target above total capacity must not delete anything. Actual disk-full writes, sudden power loss, hostile filesystem replacement, cross-host concurrent writers, and long-delayed content reclamation are not simulated by those checks. POSIX operation creation syncs both file and parent directory; Windows uses file flushing and is not certified against power loss. Do not infer those guarantees from green CI.
+
+CI runs the real suite on ephemeral Linux, Windows, and macOS runners, without uploading build artifacts.

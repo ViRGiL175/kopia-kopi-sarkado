@@ -1,256 +1,181 @@
-package app
+package app_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/kopia"
-	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/planner"
+	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/app"
+	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/testrepo"
 )
 
-type realIntegrationEnv struct {
-	repoDir    string
-	sourceDir  string
-	configFile string
-	password   string
-	before     []kopia.Snapshot
-	client     kopia.Client
-}
-
-func TestRunPreflightDeletesUpToMaxPassesWhenStillInsufficient(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := realIntegrationContext(t)
-	defer cancel()
-
-	env := setupRealIntegrationEnv(t, ctx, 10)
-	freeBytes := int64(1 << 30)
-	estimateBytes, err := env.client.EstimateSnapshotSize(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("EstimateSnapshotSize() error = %v", err)
-	}
-
-	plan := planner.BuildPlan(env.before, planner.Options{KeepLatest: 1})
-	if len(plan.Candidates) < 3 {
-		t.Fatalf("expected at least 3 candidates, got %d", len(plan.Candidates))
-	}
-
-	freeProbe := staticFreeBytes(freeBytes)
-	result, code, err := runPreflight(ctx, os.Stdout, Config{
-		Source:             env.sourceDir,
-		SpacePath:          env.repoDir,
-		MaxPasses:          2,
-		BatchSize:          1,
-		KeepLatest:         1,
-		EstimateMultiplier: 1,
-		ServiceReserve:     0,
-		SafetyMargin:       freeBytes + (2 * estimateBytes),
-		RunMaintenance:     false,
-		MaintenanceMode:    "quick",
-		Apply:              true,
-	}, env.client, freeProbe)
-	if err != nil {
-		t.Fatalf("runPreflight() error = %v", err)
-	}
-
-	if code != ExitInsufficientSpace {
-		t.Fatalf("runPreflight() code = %d, want %d", code, ExitInsufficientSpace)
-	}
-	if result.ReadyForBackup {
-		t.Fatal("expected backup to remain blocked after max passes")
-	}
-	if len(result.DeletedIDs) != 2 {
-		t.Fatalf("expected exactly 2 deletions, got %d", len(result.DeletedIDs))
-	}
-	if result.PassesExecuted != 2 {
-		t.Fatalf("expected exactly 2 executed passes, got %d", result.PassesExecuted)
-	}
-
-	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() after preflight error = %v", err)
-	}
-	if len(afterSnapshots) != len(env.before)-2 {
-		t.Fatalf("expected two deleted snapshots, before=%d after=%d", len(env.before), len(afterSnapshots))
-	}
-}
-
-func TestRunPreflightStopsAtRetentionFloorWhenStillInsufficient(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := realIntegrationContext(t)
-	defer cancel()
-
-	env := setupRealIntegrationEnv(t, ctx, 10)
-	freeBytes := int64(1 << 30)
-	estimateBytes, err := env.client.EstimateSnapshotSize(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("EstimateSnapshotSize() error = %v", err)
-	}
-
-	plan := planner.BuildPlan(env.before, planner.Options{KeepLatest: 1})
-	optimisticAll := estimateBytes * int64(len(plan.Candidates))
-	if optimisticAll <= 1 {
-		t.Fatalf("expected optimistic reclaim > 1, got %d", optimisticAll)
-	}
-
-	result, code, err := runPreflight(ctx, os.Stdout, Config{
-		Source:             env.sourceDir,
-		SpacePath:          env.repoDir,
-		MaxPasses:          10,
-		BatchSize:          10,
-		KeepLatest:         1,
-		EstimateMultiplier: 1,
-		ServiceReserve:     0,
-		SafetyMargin:       freeBytes + optimisticAll - estimateBytes - 1,
-		RunMaintenance:     false,
-		MaintenanceMode:    "quick",
-		Apply:              true,
-	}, env.client, staticFreeBytes(freeBytes))
-	if err != nil {
-		t.Fatalf("runPreflight() error = %v", err)
-	}
-
-	if code != ExitInsufficientSpace {
-		t.Fatalf("runPreflight() code = %d, want %d", code, ExitInsufficientSpace)
-	}
-	if result.ReadyForBackup {
-		t.Fatal("expected backup to remain blocked at the retention floor")
-	}
-
-	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() after preflight error = %v", err)
-	}
-	if len(afterSnapshots) != len(result.Plan.Kept) {
-		t.Fatalf("expected to stop at retention floor, kept=%d after=%d", len(result.Plan.Kept), len(afterSnapshots))
-	}
-	if len(result.DeletedIDs)+len(afterSnapshots) != len(env.before) {
-		t.Fatalf("expected deleted + kept to match original snapshots, before=%d deleted=%d after=%d", len(env.before), len(result.DeletedIDs), len(afterSnapshots))
-	}
-
-	keptIDs := decisionIDs(result.Plan.Kept)
-	afterIDs := snapshotIDs(afterSnapshots)
-	for _, id := range keptIDs {
-		if !slices.Contains(afterIDs, id) {
-			t.Fatalf("expected kept snapshot %s to remain after preflight", id)
+func prepared(t *testing.T) (*testrepo.Repo, app.Config) {
+	t.Helper()
+	r := testrepo.New(t)
+	for i := 0; i < 10; i++ {
+		if i == 4 {
+			r.Snapshot(i, "--pin=important")
+		} else if i == 5 {
+			r.Snapshot(i, "--tags=important:yes")
+		} else {
+			r.Snapshot(i)
 		}
 	}
+	r.Retention(r.Source, 2)
+	cfg := r.Config()
+	cfg.Apply = true
+	cfg.SafetyMargin = r.InsufficientMargin()
+	cfg.ProtectTags = []string{"tag:important=yes"}
+	return r, cfg
 }
 
-func realIntegrationContext(t *testing.T) (context.Context, context.CancelFunc) {
-	t.Helper()
-
-	if _, err := exec.LookPath("kopia"); err != nil {
-		t.Skip("kopia CLI not found in PATH")
-	}
-
-	return context.WithTimeout(context.Background(), 2*time.Minute)
-}
-
-func setupRealIntegrationEnv(t *testing.T, ctx context.Context, snapshotCount int) realIntegrationEnv {
-	t.Helper()
-
-	rootDir := t.TempDir()
-	repoDir := filepath.Join(rootDir, "repo")
-	sourceDir := filepath.Join(rootDir, "source")
-	configFile := filepath.Join(rootDir, "repository.config")
-	password := "integration-secret"
-
-	mustMkdirAll(t, repoDir)
-	mustMkdirAll(t, sourceDir)
-
-	runKopia(t, ctx, password,
-		"repository", "create", "filesystem",
-		"--path", repoDir,
-		"--config-file", configFile,
-		"--password", password,
-		"--no-progress",
-	)
-
-	for i := 0; i < snapshotCount; i++ {
-		content := strings.Repeat(fmt.Sprintf("snapshot-%d-", i), 1024*8)
-		mustWriteFile(t, filepath.Join(sourceDir, "data.txt"), []byte(content))
-		runKopia(t, ctx, password,
-			"snapshot", "create",
-			"--config-file", configFile,
-			"--password", password,
-			"--no-progress",
-			sourceDir,
-		)
-	}
-
-	client := kopia.Client{Binary: "kopia", ConfigFile: configFile, Password: password}
-	beforeSnapshots, err := client.ListSnapshots(ctx, sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() before preflight error = %v", err)
-	}
-	if len(beforeSnapshots) < snapshotCount {
-		t.Fatalf("expected at least %d snapshots, got %d", snapshotCount, len(beforeSnapshots))
-	}
-
-	return realIntegrationEnv{
-		repoDir:    repoDir,
-		sourceDir:  sourceDir,
-		configFile: configFile,
-		password:   password,
-		before:     beforeSnapshots,
-		client:     client,
+func TestRunPreflightBoundsDeletionAndRestoresProtectedVersions(t *testing.T) {
+	for _, maintenance := range []bool{false, true} {
+		t.Run(fmt.Sprintf("maintenance-%t", maintenance), func(t *testing.T) {
+			r, cfg := prepared(t)
+			cfg.RunMaintenance = maintenance
+			before := r.Snapshots()
+			infoBefore := r.MaintenanceInfo()
+			result, code, err := app.RunPreflight(r.Context, io.Discard, cfg)
+			if err != nil || code != app.ExitInsufficientSpace || len(result.DeletedIDs) != 2 {
+				t.Fatalf("code=%d deleted=%v error=%v", code, result.DeletedIDs, err)
+			}
+			after := r.Snapshots()
+			if len(after) != len(before)-2 {
+				t.Fatal("unexpected number of deleted snapshots")
+			}
+			for _, d := range result.Plan.Kept {
+				var found bool
+				for _, s := range after {
+					if s.ID == d.Snapshot.ID {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("protected snapshot lost")
+				}
+			}
+			for _, s := range after {
+				r.Restore(s, fmt.Sprintf("synthetic version %d\n", s.EndTime.Minute()))
+			}
+			if !maintenance {
+				var a, b any
+				_ = json.Unmarshal(infoBefore, &a)
+				_ = json.Unmarshal(r.MaintenanceInfo(), &b)
+				if !reflect.DeepEqual(a, b) {
+					t.Fatal("automatic maintenance ran without authorization")
+				}
+			}
+			_, code, err = app.RunPreflight(r.Context, io.Discard, cfg)
+			if code != app.ExitRuntime || err == nil || len(r.Snapshots()) != len(after) {
+				t.Fatal("same operation restarted deletion budget")
+			}
+		})
 	}
 }
 
-func staticFreeBytes(free int64) freeBytesFunc {
-	return func(path string) (int64, error) {
-		return free, nil
+func TestRunPreflightRejectsWrongRepositoryAndJournalFailure(t *testing.T) {
+	r, cfg := prepared(t)
+	before := len(r.Snapshots())
+	cfg.RepositoryID = "wrong"
+	if _, code, err := app.RunPreflight(r.Context, io.Discard, cfg); code != app.ExitRuntime || err == nil {
+		t.Fatal("wrong repository was accepted")
+	}
+	cfg.RepositoryID = r.Status.ID
+	cfg.OperationFile = filepath.Join(r.Root, "missing-directory", "operation")
+	if _, _, err := app.RunPreflight(r.Context, io.Discard, cfg); err == nil {
+		t.Fatal("missing journal directory was accepted")
+	}
+	cfg.OperationFile = filepath.Join(r.Storage, "journal")
+	if _, _, err := app.RunPreflight(r.Context, io.Discard, cfg); err == nil {
+		t.Fatal("journal inside storage was accepted")
+	}
+	if len(r.Snapshots()) != before {
+		t.Fatal("validation error deleted snapshots")
 	}
 }
 
-func decisionIDs(decisions []planner.Decision) []string {
-	ids := make([]string, 0, len(decisions))
-	for _, decision := range decisions {
-		ids = append(ids, decision.Snapshot.ID)
+type onPlan func()
+
+func (f onPlan) Write(p []byte) (int, error) { f(); return len(p), nil }
+
+func TestRunPreflightRejectsConcurrentPinChange(t *testing.T) {
+	r, cfg := prepared(t)
+	before := r.Snapshots()
+	writer := onPlan(func() { r.Run("snapshot", "pin", "--add=concurrent", before[2].ID) })
+	result, code, err := app.RunPreflight(r.Context, writer, cfg)
+	if err == nil || code != app.ExitRuntime || len(result.DeletedIDs) != 0 {
+		t.Fatalf("concurrent pin not detected: %d %v", code, err)
 	}
-	return ids
-}
-
-func snapshotIDs(snapshots []kopia.Snapshot) []string {
-	ids := make([]string, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		ids = append(ids, snapshot.ID)
-	}
-	return ids
-}
-
-func runKopia(t *testing.T, ctx context.Context, password string, args ...string) string {
-	t.Helper()
-
-	cmd := exec.CommandContext(ctx, "kopia", args...)
-	cmd.Env = append(cmd.Environ(), "KOPIA_PASSWORD="+password)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("kopia %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
-	}
-
-	return string(output)
-}
-
-func mustMkdirAll(t *testing.T, path string) {
-	t.Helper()
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll(%q) error = %v", path, err)
+	if len(r.Snapshots()) != len(before) {
+		t.Fatal("concurrent update caused deletion")
 	}
 }
 
-func mustWriteFile(t *testing.T, path string, data []byte) {
-	t.Helper()
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatalf("WriteFile(%q) error = %v", path, err)
+func TestRunPreflightCancellationRecordsPartialOutcomeAndBlocksRetry(t *testing.T) {
+	r, cfg := prepared(t)
+	cfg.BatchSize = 4
+	ctx, cancel := context.WithCancel(r.Context)
+	defer cancel()
+	watcherDone := make(chan bool, 1)
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				watcherDone <- false
+				return
+			case <-ticker.C:
+				b, err := os.ReadFile(cfg.OperationFile)
+				if err == nil && bytes.Contains(b, []byte("delete-confirmed")) {
+					cancel()
+					watcherDone <- true
+					return
+				}
+			}
+		}
+	}()
+	result, code, err := app.RunPreflight(ctx, io.Discard, cfg)
+	cancel()
+	if !<-watcherDone {
+		t.Fatal("did not observe a real completed deletion to interrupt after")
+	}
+	if err == nil || code != app.ExitRuntime || len(result.DeletedIDs) == 0 {
+		t.Fatalf("partial outcome missing: code=%d deleted=%v error=%v", code, result.DeletedIDs, err)
+	}
+	journal, readErr := os.ReadFile(cfg.OperationFile)
+	if readErr != nil || !strings.Contains(string(journal), "delete-intent") {
+		t.Fatal("missing durable delete intent")
+	}
+	after := r.Snapshots()
+	for _, s := range after {
+		r.Restore(s, fmt.Sprintf("synthetic version %d\n", s.EndTime.Minute()))
+	}
+	_, code, err = app.RunPreflight(r.Context, io.Discard, cfg)
+	if code != app.ExitRuntime || err == nil || len(r.Snapshots()) != len(after) {
+		t.Fatal("interrupted operation restarted")
+	}
+}
+
+func TestRunPreflightStopsAtNativeRetentionFloor(t *testing.T) {
+	r, cfg := prepared(t)
+	r.Retention(r.Source, 100)
+	result, code, err := app.RunPreflight(r.Context, io.Discard, cfg)
+	if err != nil || code != app.ExitInsufficientSpace || len(result.DeletedIDs) != 0 || len(result.Plan.Candidates) != 0 {
+		t.Fatalf("native floor not respected: code=%d error=%v", code, err)
+	}
+	for _, s := range r.Snapshots() {
+		if !s.Healthy() {
+			t.Fatalf("unexpected incomplete fixture: %+v", s)
+		}
 	}
 }

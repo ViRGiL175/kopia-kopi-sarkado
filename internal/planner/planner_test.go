@@ -19,6 +19,10 @@ func TestBuildPlanKeepsOldestLatestAndRepresentatives(t *testing.T) {
 		{ID: "s7", EndTime: now},
 	}
 
+	for i := range snapshots {
+		snapshots[i].Stats = &kopia.SnapshotStats{}
+		snapshots[i].RootEntry = &kopia.RootEntry{ObjectID: "synthetic-object", Type: "d", Summary: &kopia.DirectorySummary{}}
+	}
 	plan := BuildPlan(snapshots, Options{KeepLatest: 2})
 	if len(plan.Kept) < 4 {
 		t.Fatalf("expected multiple kept snapshots, got %d", len(plan.Kept))

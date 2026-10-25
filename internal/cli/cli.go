@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/app"
 	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/units"
@@ -49,8 +50,10 @@ func runPreflight(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return app.ExitUsage
 	}
 
-	config.Apply = true
-	_, code, err := app.RunPreflight(ctx, stdout, config)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	result, code, err := app.RunPreflight(ctx, stdout, config)
+	reportResult(stdout, result, code)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return code
@@ -65,8 +68,14 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return app.ExitUsage
 	}
 
-	config.Apply = false
-	_, code, err := app.RunPreflight(ctx, stdout, config)
+	if config.Apply {
+		fmt.Fprintln(stderr, "plan does not accept --apply")
+		return app.ExitUsage
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	result, code, err := app.RunPreflight(ctx, stdout, config)
+	reportResult(stdout, result, code)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return code
@@ -89,10 +98,12 @@ func parseConfig(args []string, stderr io.Writer) (app.Config, bool) {
 
 	config := app.Config{}
 	fs.StringVar(&config.Source, "source", "", "Source path known to Kopia")
-	fs.StringVar(&config.SpacePath, "space-path", "", "Path on the storage filesystem used to measure free space")
 	fs.StringVar(&config.KopiaBinary, "kopia-bin", "kopia", "Path to kopia binary")
 	fs.StringVar(&config.KopiaConfigFile, "config-file", "", "Path to Kopia config file")
-	fs.StringVar(&config.KopiaPassword, "password", "", "Kopia repository password")
+	fs.BoolVar(&config.Apply, "apply", false, "Allow bounded automatic snapshot deletion")
+	fs.BoolVar(&config.ExclusiveAccess, "exclusive-access", false, "Confirm external serialization of every repository writer and policy change")
+	fs.StringVar(&config.RepositoryID, "repository-id", "", "Expected repository ID (required with --apply)")
+	fs.StringVar(&config.OperationFile, "operation-file", "", "New durable operation journal outside source and storage; reuse this path on retries")
 	fs.IntVar(&config.MaxPasses, "max-passes", 3, "Maximum prune passes")
 	fs.IntVar(&config.BatchSize, "batch-size", 2, "Snapshots to delete per pass")
 	fs.IntVar(&config.KeepLatest, "keep-latest", 3, "Always keep the latest N snapshots")
@@ -107,8 +118,8 @@ func parseConfig(args []string, stderr io.Writer) (app.Config, bool) {
 		return app.Config{}, false
 	}
 
-	if strings.TrimSpace(config.Source) == "" || strings.TrimSpace(config.SpacePath) == "" {
-		fmt.Fprintln(stderr, "source and space-path are required")
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "unexpected positional arguments")
 		return app.Config{}, false
 	}
 
@@ -127,6 +138,10 @@ func parseConfig(args []string, stderr io.Writer) (app.Config, bool) {
 	config.SafetyMargin = safetyMargin
 	config.ServiceReserve = serviceReserve
 	config.ProtectTags = protectTags
+	if err := config.Validate(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return app.Config{}, false
+	}
 
 	return config, true
 }
@@ -136,12 +151,25 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  plan       Build a pruning plan and report required headroom")
-	fmt.Fprintln(w, "  preflight  Execute pruning passes until headroom is sufficient or fail")
+	fmt.Fprintln(w, "  preflight  Check headroom; --apply enables bounded automatic pruning")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Common flags:")
 	fmt.Fprintln(w, "  --source <path>          Source path already tracked by Kopia")
-	fmt.Fprintln(w, "  --space-path <path>      Path on the target storage filesystem to measure free space")
+	fmt.Fprintln(w, "  --config-file <path>     Explicit absolute Kopia configuration path")
+	fmt.Fprintln(w, "  --apply                 Authorize deletion (preflight only)")
+	fmt.Fprintln(w, "  --repository-id <id>     Bind deletion to the reviewed repository ID")
+	fmt.Fprintln(w, "  --operation-file <path>  Durable one-operation journal; never rotate on retries")
 	fmt.Fprintln(w, "  --estimate-multiplier    Extra multiplier over snapshot estimate")
 	fmt.Fprintln(w, "  --safety-margin <size>   Extra margin like 1GiB")
 	fmt.Fprintln(w, "  --service-reserve <size> Reserve for Kopia metadata and temp writes")
+}
+
+func reportResult(w io.Writer, result app.Result, code int) {
+	for _, id := range result.DeletedIDs {
+		fmt.Fprintf(w, "confirmed-deleted: %s\n", id)
+	}
+	for _, id := range result.UncertainIDs {
+		fmt.Fprintf(w, "deletion-unknown: %s\n", id)
+	}
+	fmt.Fprintf(w, "ready: %t\nexit-code: %d\n", result.ReadyForBackup, code)
 }

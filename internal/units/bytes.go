@@ -3,7 +3,7 @@ package units
 import (
 	"fmt"
 	"math"
-	"strconv"
+	"math/big"
 	"strings"
 )
 
@@ -55,9 +55,9 @@ func ParseBytes(value string) (int64, error) {
 		unitPart = "B"
 	}
 
-	numberValue, err := strconv.ParseFloat(numberPart, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse size %q: %w", value, err)
+	numberValue, ok := new(big.Rat).SetString(numberPart)
+	if !ok {
+		return 0, fmt.Errorf("invalid numeric size")
 	}
 
 	multiplier, ok := unitMultipliers[unitPart]
@@ -65,7 +65,39 @@ func ParseBytes(value string) (int64, error) {
 		return 0, fmt.Errorf("unsupported unit %q", unitPart)
 	}
 
-	return int64(math.Ceil(numberValue * multiplier)), nil
+	return ceilBytes(numberValue.Mul(numberValue, new(big.Rat).SetInt64(int64(multiplier))))
+}
+
+func RequiredBytes(estimate int64, multiplier float64, reserve, margin int64) (int64, error) {
+	if estimate < 0 || reserve < 0 || margin < 0 || multiplier < 1 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return 0, fmt.Errorf("headroom values must be non-negative and multiplier must be finite and at least 1")
+	}
+
+	scaled := new(big.Rat).Mul(new(big.Rat).SetInt64(estimate), new(big.Rat).SetFloat64(multiplier))
+	required, err := ceilBytes(scaled)
+	if err != nil {
+		return 0, err
+	}
+	for _, extra := range []int64{reserve, margin} {
+		if extra > math.MaxInt64-required {
+			return 0, fmt.Errorf("required headroom exceeds the supported range")
+		}
+		required += extra
+	}
+
+	return required, nil
+}
+
+func ceilBytes(value *big.Rat) (int64, error) {
+	whole, remainder := new(big.Int), new(big.Int)
+	whole.QuoRem(value.Num(), value.Denom(), remainder)
+	if remainder.Sign() > 0 {
+		whole.Add(whole, big.NewInt(1))
+	}
+	if value.Sign() < 0 || !whole.IsInt64() {
+		return 0, fmt.Errorf("size is outside the supported range")
+	}
+	return whole.Int64(), nil
 }
 
 func MustParseBytes(value string) int64 {
