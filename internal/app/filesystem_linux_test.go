@@ -82,9 +82,9 @@ func testVolume(t *testing.T) string {
 	return volume
 }
 
-func writePayload(t *testing.T, r *testrepo.Repo, version int) [32]byte {
+func writePayload(t *testing.T, r *testrepo.Repo, version, size int) [32]byte {
 	t.Helper()
-	payload := make([]byte, 4<<20)
+	payload := make([]byte, size)
 	_, _ = rand.New(rand.NewSource(int64(1000 + version))).Read(payload)
 	if err := os.WriteFile(filepath.Join(r.Source, "payload.bin"), payload, 0o600); err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestLinuxFullRepositoryVolumeBlocksPruningAndPreservesCopies(t *testing.T) 
 	r := testrepo.NewOnVolume(t, volume)
 	hashes := map[string][32]byte{}
 	for i := 0; i < 8; i++ {
-		hash := writePayload(t, r, i)
+		hash := writePayload(t, r, i, 4<<20)
 		snapshot := r.Snapshot(i)
 		hashes[snapshot.ID] = hash
 	}
@@ -210,7 +210,11 @@ func TestLinuxNormalMaintenanceDelayAndIsolatedReclamation(t *testing.T) {
 	hashes := map[string][32]byte{}
 	originals := map[string]kopia.Snapshot{}
 	for i := 0; i < 8; i++ {
-		hash := writePayload(t, r, i)
+		// Keep each version above Kopia's short-pack threshold (60% of the
+		// default 20MiB pack). Otherwise maintenance can consolidate small
+		// versions into a mostly-live pack and correctly leave their dead bytes.
+		// Eight unique versions occupy 128MiB within the bounded 256MiB volume.
+		hash := writePayload(t, r, i, 16<<20)
 		snapshot := r.Snapshot(i)
 		hashes[snapshot.ID] = hash
 		originals[snapshot.ID] = snapshot
@@ -288,7 +292,7 @@ func TestLinuxNormalMaintenanceDelayAndIsolatedReclamation(t *testing.T) {
 		}
 	}
 	if reclaimed < 2<<20 {
-		t.Fatalf("expected physical reclamation of unique 4MiB content, got %d bytes\n%s", reclaimed, maintenanceOutput.String())
+		t.Fatalf("expected physical reclamation of unique content, got %d bytes\n%s", reclaimed, maintenanceOutput.String())
 	}
 	remaining := r.Snapshots()
 	if !slices.Equal(snapshotIDs(afterNormal), snapshotIDs(remaining)) {
