@@ -114,8 +114,24 @@ go test -count=1 -v -timeout=10m ./...
 
 Optionally set `KKS_KOPIA_BINARY` to the absolute executable path. With integration enabled, missing Kopia fails the suite. Tests create disposable local repositories and synthetic files with separate config, password, home, cache, and temporary directories, and no inherited Kopia environment. Credential persistence and snapshot actions are disabled. No existing repository is used. Use isolated CI runners or a disposable machine; the test processes are not an OS sandbox.
 
-The suite exercises real retention JSON, pins, nested sources, incomplete uploads, dry-run, bounded application, restoration of retained versions, Unicode paths, hardlinks, symlinks on Unix, maintenance opt-in, concurrent pin changes, cancellation after partial success, and retry refusal. Arithmetic and argument validation use focused unit tests. No fake Kopia implementation is present.
+The cross-platform suite exercises real retention JSON, pins, nested sources, incomplete uploads, dry-run, bounded application, restoration of retained versions, Unicode paths, hardlinks, symlinks on Unix, maintenance opt-in, concurrent pin changes, cancellation after partial success, and retry refusal. Arithmetic and argument validation use focused unit tests. No fake Kopia implementation is present.
 
-A requested reserve above current free bytes but below total capacity exercises insufficient-headroom behavior without filling the disk. An impossible target above total capacity must not delete anything. Actual disk-full writes, sudden power loss, hostile filesystem replacement, cross-host concurrent writers, and long-delayed content reclamation are not simulated by those checks. POSIX operation creation syncs both file and parent directory; Windows uses file flushing and is not certified against power loss. Do not infer those guarantees from green CI.
+A requested reserve above current free bytes but below total capacity exercises insufficient-headroom behavior without filling the disk. An impossible target above total capacity must not delete anything. POSIX operation creation syncs both file and parent directory; Windows uses file flushing.
 
-CI runs the real suite on ephemeral Linux, Windows, and macOS runners, without uploading build artifacts.
+### Linux process and filesystem checks
+
+The additional required CI job runs `ci/linux-safety.sh` on a disposable hosted Ubuntu runner. It creates a **256MiB ext4 image**, attaches only that image through a loop device, and verifies the backing file and capacity before any fill operation. Tests keep configs, credentials, caches, journals and restored copies outside that small volume. Cleanup unmounts and detaches the exact owned device; if unmount fails, it leaves the image intact. The script refuses non-hosted runners and does not fill the runner's main filesystem.
+
+This job verifies the wrapper's decisions and retries with real Kopia:
+
+- Two processes which have already planned must not both claim the same operation file. This is an operation-file claim, not a repository-wide distributed lock.
+- Changes to history, retention, and pins at deterministic checkpoints stop further pruning once observed.
+- A real subprocess is killed with SIGKILL **after Kopia returns success but before the wrapper records the deletion result**. Exactly the intended manifest is absent, the journal retains an unresolved intent, and a fresh process using the same operation refuses more deletions. Remaining control versions restore correctly.
+- An actually full test volume produces a real failed repository mutation. The wrapper stops after one intent, preserves protected recovery points, and does not restart the operation when space returns.
+- Normal full maintenance preserves young deleted-manifest content under Kopia's default safety delays, while pruning/retry remains bounded. A separate, synchronous and exclusively owned test repository then runs full maintenance with `--safety=none` to measure actual reclaimed bytes and restore remaining control versions. **This test-only flag is never passed by the application or used with competing clients.** It demonstrates reclamation on isolated synchronous storage, not safety of bypassing delays in production.
+
+Subprocess checkpoints use a test-only writer around the existing output interface: it waits for an explicit controller acknowledgement. The application only emits ordinary `operation: started` and `operation: delete-command-completed <id>` progress messages, has no test pause flags/environment, and still uses the actual Kopia executable. There are no timing guesses or mocked CLI responses at these checkpoints. `delete-command-completed` is not a durable confirmation; the journal and reconciliation determine the outcome.
+
+Run both the cross-platform matrix and the Linux safety job for the full CI contract. Linux-specific cases intentionally skip outside their isolated job. Physical power cuts, hostile filesystem replacement, arbitrary cross-host writers and a 24-hour wall-clock maintenance soak are outside this suite. A VM power-cut experiment is not a gate for this wrapper: Kopia owns its storage consistency guarantees under its [documented storage requirements](https://kopia.io/docs/advanced/consistency/); these tests check the wrapper's selection, accounting and repeat behavior.
+
+CI uploads no build artifacts or test repository images.

@@ -28,6 +28,15 @@ type Repo struct {
 }
 
 func New(t *testing.T) *Repo {
+	return newRepo(t, "")
+}
+
+// NewOnVolume keeps only repository storage on a separately validated test volume.
+func NewOnVolume(t *testing.T, volume string) *Repo {
+	return newRepo(t, volume)
+}
+
+func newRepo(t *testing.T, volume string) *Repo {
 	t.Helper()
 	if os.Getenv("KKS_INTEGRATION") != "1" {
 		t.Skip("real Kopia tests require KKS_INTEGRATION=1 in an isolated environment")
@@ -48,6 +57,17 @@ func New(t *testing.T) *Repo {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
 	r := &Repo{T: t, Context: ctx, Root: root, Storage: filepath.Join(root, "repo"), Source: filepath.Join(root, "sources", "source with spaces")}
+	if volume != "" {
+		r.Storage, err = os.MkdirTemp(volume, "kks-repo-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.RemoveAll(r.Storage); err != nil {
+				t.Errorf("remove disposable storage: %v", err)
+			}
+		})
+	}
 	for _, name := range []string{r.Storage, r.Source, filepath.Join(root, "home"), filepath.Join(root, "cache"), filepath.Join(root, "tmp")} {
 		if err := os.MkdirAll(name, 0o700); err != nil {
 			t.Fatal(err)

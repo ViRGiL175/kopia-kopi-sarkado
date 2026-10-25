@@ -171,6 +171,9 @@ func RunPreflight(ctx context.Context, stdout io.Writer, cfg Config) (result Res
 			err = errors.Join(err, errors.New("operation journal could not be finalized; inspect repository before retrying"))
 		}
 	}()
+	if _, err = fmt.Fprintln(stdout, "operation: started"); err != nil {
+		return result, ExitRuntime, err
+	}
 	remaining := append([]planner.Decision(nil), plan.Candidates...)
 	expected := snapshots
 	for pass := 1; pass <= cfg.MaxPasses && len(remaining) > 0; pass++ {
@@ -199,6 +202,13 @@ func RunPreflight(ctx context.Context, stdout io.Writer, cfg Config) (result Res
 				return result, ExitRuntime, err
 			}
 			deleteErr := client.DeleteSnapshot(ctx, decision.Snapshot.ID)
+			if deleteErr == nil {
+				if _, err = fmt.Fprintf(stdout, "operation: delete-command-completed %s\n", decision.Snapshot.ID); err != nil {
+					result.UncertainIDs = append(result.UncertainIDs, decision.Snapshot.ID)
+					_ = journal.record(journalEvent{Event: "delete-unknown", ID: decision.Snapshot.ID})
+					return result, ExitRuntime, errors.New("cannot report completed delete command; inspect journal and repository before retrying")
+				}
+			}
 			afterStatus, readErr := client.Status(ctx)
 			var after []kopia.Snapshot
 			if readErr == nil && !sameRepository(status, afterStatus) {

@@ -105,7 +105,12 @@ func TestRunPreflightRejectsWrongRepositoryAndJournalFailure(t *testing.T) {
 
 type onPlan func()
 
-func (f onPlan) Write(p []byte) (int, error) { f(); return len(p), nil }
+func (f onPlan) Write(p []byte) (int, error) {
+	if bytes.HasPrefix(p, []byte("repository-id:")) {
+		f()
+	}
+	return len(p), nil
+}
 
 func TestRunPreflightRejectsConcurrentPinChange(t *testing.T) {
 	r, cfg := prepared(t)

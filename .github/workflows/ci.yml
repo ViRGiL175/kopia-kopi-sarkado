@@ -80,3 +80,30 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: go test -count=1 -v -timeout=10m ./...
+
+  linux-safety:
+    name: Linux process and filesystem safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install real Kopia
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/kopia-linux-safety.tar.gz"
+          curl -fsSL -o "$archive" https://github.com/kopia/kopia/releases/download/v0.23.1/kopia-0.23.1-linux-x64.tar.gz
+          echo "416d0f84a3dbb321a8b2d8f0997b1a0a6e915babe79ee76fa6e4d2bd1e1c5178  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "KKS_KOPIA_BINARY=$RUNNER_TEMP/kopia-0.23.1-linux-x64/kopia" >> "$GITHUB_ENV"
+      - name: Run isolated process and filesystem checks
+        shell: bash
+        run: bash ci/linux-safety.sh
