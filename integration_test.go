@@ -1,383 +1,185 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"fmt"
-	mathrand "math/rand"
+	"io"
+	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
+	"runtime"
 	"testing"
-	"time"
 
 	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/app"
-	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/kopia"
-	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/storage"
+	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/planner"
+	"github.com/ViRGiL175/kopia-kopi-sarkado/internal/testrepo"
 )
 
-const impossibleSafetyMargin = int64(1 << 30)
-const heavySnapshotCount = 4
-const heavyFileCount = 4
-const heavyFileSize = int64(8 << 20)
-const heavyEstimateFloor = int64(16 << 20)
-
-type integrationEnv struct {
-	repoDir    string
-	sourceDir  string
-	configFile string
-	password   string
-	before     []kopia.Snapshot
-	beforeFree int64
-	client     kopia.Client
-}
-
 func TestPreflightIntegrationReadyWithoutDeletion(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := integrationContext(t)
-	defer cancel()
-
-	env := setupIntegrationEnv(t, ctx, 3)
-
-	result, code, err := app.RunPreflight(ctx, os.Stdout, app.Config{
-		Source:             env.sourceDir,
-		SpacePath:          env.repoDir,
-		KopiaBinary:        "kopia",
-		KopiaConfigFile:    env.configFile,
-		KopiaPassword:      env.password,
-		MaxPasses:          3,
-		BatchSize:          2,
-		KeepLatest:         1,
-		EstimateMultiplier: 1,
-		ServiceReserve:     0,
-		SafetyMargin:       0,
-		RunMaintenance:     false,
-		MaintenanceMode:    "quick",
-		Apply:              true,
-	})
-	if err != nil {
-		t.Fatalf("RunPreflight() error = %v", err)
+	r := testrepo.New(t)
+	for i := 0; i < 3; i++ {
+		r.Snapshot(i)
 	}
-
-	if code != app.ExitOK {
-		t.Fatalf("RunPreflight() code = %d, want %d", code, app.ExitOK)
+	before := r.Snapshots()
+	cfg := r.Config()
+	cfg.Apply = true
+	result, code, err := app.RunPreflight(r.Context, io.Discard, cfg)
+	if err != nil || code != app.ExitOK || !result.ReadyForBackup || len(result.DeletedIDs) != 0 {
+		t.Fatalf("result=%+v code=%d error=%v", result, code, err)
 	}
-	if !result.ReadyForBackup {
-		t.Fatal("expected backup to be allowed when free space is already sufficient")
+	if len(r.Snapshots()) != len(before) {
+		t.Fatal("ready preflight changed snapshots")
 	}
-	if len(result.DeletedIDs) != 0 {
-		t.Fatalf("expected no deletions, got %d", len(result.DeletedIDs))
-	}
-	if result.PassesExecuted != 0 {
-		t.Fatalf("expected zero passes executed, got %d", result.PassesExecuted)
-	}
-
-	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() after preflight error = %v", err)
-	}
-	if len(afterSnapshots) != len(env.before) {
-		t.Fatalf("expected snapshot count to stay unchanged, before=%d after=%d", len(env.before), len(afterSnapshots))
+	if _, err := os.Stat(cfg.OperationFile); !os.IsNotExist(err) {
+		t.Fatal("ready preflight must not start a deletion operation")
 	}
 }
 
-func TestPreflightIntegrationSkipsDeletionWhenTargetIsHeuristicallyImpossible(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := integrationContext(t)
-	defer cancel()
-
-	env := setupIntegrationEnv(t, ctx, 6)
-
-	result, code, err := app.RunPreflight(ctx, os.Stdout, app.Config{
-		Source:             env.sourceDir,
-		SpacePath:          env.repoDir,
-		KopiaBinary:        "kopia",
-		KopiaConfigFile:    env.configFile,
-		KopiaPassword:      env.password,
-		MaxPasses:          10,
-		BatchSize:          10,
-		KeepLatest:         1,
-		EstimateMultiplier: 1,
-		ServiceReserve:     0,
-		SafetyMargin:       env.beforeFree + impossibleSafetyMargin,
-		RunMaintenance:     false,
-		MaintenanceMode:    "quick",
-		Apply:              true,
-	})
-	if err != nil {
-		t.Fatalf("RunPreflight() error = %v", err)
+func TestPreflightIntegrationInsufficientDryRun(t *testing.T) {
+	r := testrepo.New(t)
+	for i := 0; i < 8; i++ {
+		r.Snapshot(i)
 	}
-
-	if code != app.ExitInsufficientSpace {
-		t.Fatalf("RunPreflight() code = %d, want %d", code, app.ExitInsufficientSpace)
+	r.Retention(r.Source, 1)
+	cfg := r.Config()
+	cfg.SafetyMargin = 1 << 50
+	var report bytes.Buffer
+	result, code, err := app.RunPreflight(r.Context, &report, cfg)
+	if err != nil || code != app.ExitInsufficientSpace || result.ReadyForBackup || len(result.DeletedIDs) != 0 {
+		t.Fatalf("code=%d error=%v result=%+v", code, err, result)
 	}
-	if result.ReadyForBackup {
-		t.Fatal("expected backup to remain blocked when pruning is heuristically impossible")
+	if len(result.Plan.Candidates) == 0 {
+		t.Fatal("fixture must have disposable snapshots")
 	}
-	if len(result.DeletedIDs) != 0 {
-		t.Fatalf("expected no deletions for heuristically impossible target, got %d", len(result.DeletedIDs))
-	}
-	if result.PassesExecuted != 0 {
-		t.Fatalf("expected zero passes executed for heuristically impossible target, got %d", result.PassesExecuted)
-	}
-	if result.FreeBytes+result.MaxReclaimable >= result.RequiredBytes {
-		t.Fatalf("expected optimistic reclaim to stay below required headroom, free=%d reclaim=%d required=%d", result.FreeBytes, result.MaxReclaimable, result.RequiredBytes)
-	}
-
-	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() after preflight error = %v", err)
-	}
-	if len(afterSnapshots) != len(env.before) {
-		t.Fatalf("expected snapshot count to stay unchanged, before=%d after=%d", len(env.before), len(afterSnapshots))
-	}
-}
-func TestPreflightIntegrationLargeDataset(t *testing.T) {
-	ctx, cancel := integrationContextWithTimeout(t, 10*time.Minute)
-	defer cancel()
-
-	env := setupLargeIntegrationEnv(t, ctx, heavySnapshotCount, heavyFileCount, heavyFileSize)
-
-	result, code, err := app.RunPreflight(ctx, os.Stdout, app.Config{
-		Source:             env.sourceDir,
-		SpacePath:          env.repoDir,
-		KopiaBinary:        "kopia",
-		KopiaConfigFile:    env.configFile,
-		KopiaPassword:      env.password,
-		MaxPasses:          3,
-		BatchSize:          2,
-		KeepLatest:         1,
-		EstimateMultiplier: 1,
-		ServiceReserve:     0,
-		SafetyMargin:       0,
-		RunMaintenance:     false,
-		MaintenanceMode:    "quick",
-		Apply:              true,
-	})
-	if err != nil {
-		t.Fatalf("RunPreflight() error = %v", err)
-	}
-
-	if code != app.ExitOK {
-		t.Fatalf("RunPreflight() code = %d, want %d", code, app.ExitOK)
-	}
-	if !result.ReadyForBackup {
-		t.Fatal("expected backup to be allowed for heavy integration dataset")
-	}
-	if len(result.DeletedIDs) != 0 {
-		t.Fatalf("expected no deletions in heavy ready path, got %d", len(result.DeletedIDs))
-	}
-	if result.EstimateBytes < heavyEstimateFloor {
-		t.Fatalf("expected estimate >= %d bytes for heavy dataset, got %d", heavyEstimateFloor, result.EstimateBytes)
-	}
-
-	afterSnapshots, err := env.client.ListSnapshots(ctx, env.sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() after preflight error = %v", err)
-	}
-	if len(afterSnapshots) != len(env.before) {
-		t.Fatalf("expected snapshot count to stay unchanged, before=%d after=%d", len(env.before), len(afterSnapshots))
-	}
-}
-
-func integrationContext(t *testing.T) (context.Context, context.CancelFunc) {
-	t.Helper()
-	return integrationContextWithTimeout(t, 2*time.Minute)
-}
-
-func integrationContextWithTimeout(t *testing.T, timeout time.Duration) (context.Context, context.CancelFunc) {
-	t.Helper()
-
-	if _, err := exec.LookPath("kopia"); err != nil {
-		t.Skip("kopia CLI not found in PATH")
-	}
-
-	return context.WithTimeout(context.Background(), timeout)
-}
-
-func setupIntegrationEnv(t *testing.T, ctx context.Context, snapshotCount int) integrationEnv {
-	t.Helper()
-
-	rootDir := t.TempDir()
-	repoDir := filepath.Join(rootDir, "repo")
-	sourceDir := filepath.Join(rootDir, "source")
-	configFile := filepath.Join(rootDir, "repository.config")
-	password := "integration-secret"
-
-	mustMkdirAll(t, repoDir)
-	mustMkdirAll(t, sourceDir)
-
-	runKopia(t, ctx, password,
-		"repository", "create", "filesystem",
-		"--path", repoDir,
-		"--config-file", configFile,
-		"--password", password,
-		"--no-progress",
-	)
-
-	for i := 0; i < snapshotCount; i++ {
-		content := strings.Repeat(fmt.Sprintf("snapshot-%d-", i), 1024*8)
-		mustWriteFile(t, filepath.Join(sourceDir, "data.txt"), []byte(content))
-		runKopia(t, ctx, password,
-			"snapshot", "create",
-			"--config-file", configFile,
-			"--password", password,
-			"--no-progress",
-			sourceDir,
-		)
-	}
-
-	client := kopia.Client{Binary: "kopia", ConfigFile: configFile, Password: password}
-	beforeSnapshots, err := client.ListSnapshots(ctx, sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() before preflight error = %v", err)
-	}
-	if len(beforeSnapshots) < snapshotCount {
-		t.Fatalf("expected at least %d snapshots, got %d", snapshotCount, len(beforeSnapshots))
-	}
-
-	freeBytes, err := storage.FreeBytes(repoDir)
-	if err != nil {
-		t.Fatalf("FreeBytes() error = %v", err)
-	}
-
-	return integrationEnv{
-		repoDir:    repoDir,
-		sourceDir:  sourceDir,
-		configFile: configFile,
-		password:   password,
-		before:     beforeSnapshots,
-		beforeFree: freeBytes,
-		client:     client,
-	}
-}
-
-func setupLargeIntegrationEnv(t *testing.T, ctx context.Context, snapshotCount, fileCount int, fileSize int64) integrationEnv {
-	t.Helper()
-
-	rootDir := t.TempDir()
-	repoDir := filepath.Join(rootDir, "repo")
-	sourceDir := filepath.Join(rootDir, "source")
-	configFile := filepath.Join(rootDir, "repository.config")
-	password := "integration-secret"
-
-	mustMkdirAll(t, repoDir)
-	mustMkdirAll(t, sourceDir)
-
-	runKopia(t, ctx, password,
-		"repository", "create", "filesystem",
-		"--path", repoDir,
-		"--config-file", configFile,
-		"--password", password,
-		"--no-progress",
-	)
-
-	for i := 0; i < snapshotCount; i++ {
-		writeLargeDatasetIteration(t, sourceDir, i, fileCount, fileSize)
-		runKopia(t, ctx, password,
-			"snapshot", "create",
-			"--config-file", configFile,
-			"--password", password,
-			"--no-progress",
-			sourceDir,
-		)
-	}
-
-	client := kopia.Client{Binary: "kopia", ConfigFile: configFile, Password: password}
-	beforeSnapshots, err := client.ListSnapshots(ctx, sourceDir)
-	if err != nil {
-		t.Fatalf("ListSnapshots() before preflight error = %v", err)
-	}
-	if len(beforeSnapshots) < snapshotCount {
-		t.Fatalf("expected at least %d snapshots, got %d", snapshotCount, len(beforeSnapshots))
-	}
-
-	freeBytes, err := storage.FreeBytes(repoDir)
-	if err != nil {
-		t.Fatalf("FreeBytes() error = %v", err)
-	}
-
-	return integrationEnv{
-		repoDir:    repoDir,
-		sourceDir:  sourceDir,
-		configFile: configFile,
-		password:   password,
-		before:     beforeSnapshots,
-		beforeFree: freeBytes,
-		client:     client,
-	}
-}
-
-func writeLargeDatasetIteration(t *testing.T, sourceDir string, iteration, fileCount int, fileSize int64) {
-	t.Helper()
-
-	for fileIndex := 0; fileIndex < fileCount; fileIndex++ {
-		path := filepath.Join(sourceDir, fmt.Sprintf("blob-%02d.bin", fileIndex))
-		if iteration == 0 || fileIndex == iteration%fileCount {
-			writePseudoRandomFile(t, path, fileSize, int64(iteration*fileCount+fileIndex+1))
+	for _, d := range result.Plan.Candidates {
+		if !bytes.Contains(report.Bytes(), []byte(d.Snapshot.ID)) {
+			t.Fatal("preview omitted a candidate")
 		}
 	}
-
-	manifest := fmt.Sprintf("iteration=%d\nupdated=blob-%02d.bin\n", iteration, iteration%fileCount)
-	mustWriteFile(t, filepath.Join(sourceDir, "manifest.txt"), []byte(manifest))
+	if len(r.Snapshots()) != 8 {
+		t.Fatal("dry run changed snapshots")
+	}
+	cfg.Apply = true
+	result, code, err = app.RunPreflight(r.Context, io.Discard, cfg)
+	if err != nil || code != app.ExitInsufficientSpace || len(result.DeletedIDs) != 0 || len(r.Snapshots()) != 8 {
+		t.Fatal("physically impossible headroom target must not delete snapshots")
+	}
 }
 
-func writePseudoRandomFile(t *testing.T, path string, size int64, seed int64) {
-	t.Helper()
-
-	file, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("Create(%q) error = %v", path, err)
-	}
-	defer file.Close()
-
-	rng := mathrand.New(mathrand.NewSource(seed))
-	buffer := make([]byte, 1<<20)
-	var written int64
-
-	for written < size {
-		chunk := len(buffer)
-		remaining := size - written
-		if remaining < int64(chunk) {
-			chunk = int(remaining)
+func TestRealKopiaRetentionPinsAndNestedSources(t *testing.T) {
+	r := testrepo.New(t)
+	for i := 0; i < 10; i++ {
+		if i == 3 {
+			r.Snapshot(i, "--pin=keep-forever")
+		} else {
+			r.Snapshot(i)
 		}
-
-		if _, err := rng.Read(buffer[:chunk]); err != nil {
-			t.Fatalf("rng.Read() error = %v", err)
+	}
+	parent := filepath.Dir(r.Source)
+	r.Run("snapshot", "create", parent, "--force-disable-actions", "--no-send-snapshot-report")
+	r.Retention(r.Source, 2)
+	history := r.Snapshots()
+	if len(history) != 10 {
+		t.Fatalf("exact source must exclude parent: got %d", len(history))
+	}
+	plan := planner.BuildPlan(history, planner.Options{KeepLatest: 1})
+	var pins, retained int
+	for _, s := range history {
+		if s.Source != r.Status.Source(r.Source) {
+			t.Fatal("ancestor leaked into exact source")
 		}
-		if _, err := file.Write(buffer[:chunk]); err != nil {
-			t.Fatalf("Write(%q) error = %v", path, err)
+		if !s.Healthy() {
+			t.Fatalf("complete real snapshot classified unhealthy: %+v", s)
 		}
-
-		written += int64(chunk)
+		if len(s.Pins) > 0 {
+			pins++
+		}
+		if len(s.RetentionReasons) > 0 {
+			retained++
+		}
+		for _, d := range plan.Candidates {
+			if s.ID == d.Snapshot.ID && (len(s.Pins) > 0 || len(s.RetentionReasons) > 0) {
+				t.Fatal("native protection lost")
+			}
+		}
+	}
+	if pins != 1 || retained < 2 || len(plan.Candidates) == 0 {
+		t.Fatalf("fixture not exercising protections: pins=%d retained=%d candidates=%d", pins, retained, len(plan.Candidates))
 	}
 }
 
-func runKopia(t *testing.T, ctx context.Context, password string, args ...string) string {
-	t.Helper()
-
-	cmd := exec.CommandContext(ctx, "kopia", args...)
-	cmd.Env = append(cmd.Environ(), "KOPIA_PASSWORD="+password)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("kopia %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
+func TestPreflightIntegrationWithLargeSnapshots(t *testing.T) {
+	r := testrepo.New(t)
+	data := make([]byte, 8<<20)
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 4; i++ {
+		_, _ = rng.Read(data)
+		if err := os.WriteFile(filepath.Join(r.Source, fmt.Sprintf("blob-%d", i)), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	return string(output)
-}
-
-func mustMkdirAll(t *testing.T, path string) {
-	t.Helper()
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll(%q) error = %v", path, err)
+	r.Snapshot(0)
+	cfg := r.Config()
+	result, code, err := app.RunPreflight(r.Context, io.Discard, cfg)
+	if err != nil || code != app.ExitOK || result.EstimateBytes < 16<<20 {
+		t.Fatalf("code=%d estimate=%d error=%v", code, result.EstimateBytes, err)
 	}
 }
 
-func mustWriteFile(t *testing.T, path string, data []byte) {
-	t.Helper()
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatalf("WriteFile(%q) error = %v", path, err)
+func TestRealKopiaIncompleteSnapshotDoesNotReplaceCompleteFloor(t *testing.T) {
+	r := testrepo.New(t)
+	for i := 0; i < 8; i++ {
+		r.Snapshot(i)
+	}
+	data := make([]byte, 512<<10)
+	rng := rand.New(rand.NewSource(2))
+	for i := 0; i < 16; i++ {
+		_, _ = rng.Read(data)
+		if err := os.WriteFile(filepath.Join(r.Source, fmt.Sprintf("partial-%02d", i)), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	partial := r.Snapshot(20, "--upload-limit-mb=1")
+	if partial.Healthy() || partial.IncompleteReason == "" {
+		t.Fatalf("real upload limit did not produce incomplete snapshot: %+v", partial)
+	}
+	r.Retention(r.Source, 1)
+	history := r.Snapshots()
+	plan := planner.BuildPlan(history, planner.Options{KeepLatest: 2})
+	for _, d := range plan.Candidates {
+		if d.Snapshot.ID == partial.ID || d.Snapshot.EndTime.Minute() == 6 || d.Snapshot.EndTime.Minute() == 7 {
+			t.Fatal("partial snapshot replaced complete retention floor")
+		}
+	}
+}
+
+func TestRealKopiaRestorePathsAndLinks(t *testing.T) {
+	r := testrepo.New(t)
+	name := "日本語-ёж.txt"
+	payload := []byte("synthetic unicode content")
+	if err := os.WriteFile(filepath.Join(r.Source, name), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(r.Source, name), filepath.Join(r.Source, "hardlink")); err != nil {
+		t.Fatal(err)
+	}
+	symlink := runtime.GOOS != "windows"
+	if symlink {
+		if err := os.Symlink(name, filepath.Join(r.Source, "symlink")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := r.Snapshot(0)
+	r.Restore(s, "synthetic version 0\n")
+	destination := filepath.Join(r.Root, "restore-"+s.ID)
+	names := []string{name, "hardlink"}
+	if symlink {
+		names = append(names, "symlink")
+	}
+	for _, n := range names {
+		got, err := os.ReadFile(filepath.Join(destination, n))
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("restored %q: %v", n, err)
+		}
 	}
 }

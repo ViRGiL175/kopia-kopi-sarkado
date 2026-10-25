@@ -38,30 +38,52 @@ func BuildPlan(snapshots []kopia.Snapshot, options Options) Result {
 
 	sorted := append([]kopia.Snapshot(nil), snapshots...)
 	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].EndTime.Equal(sorted[j].EndTime) {
+			return sorted[i].ID < sorted[j].ID
+		}
 		return sorted[i].EndTime.Before(sorted[j].EndTime)
 	})
 
 	keepReasons := make(map[string]string, len(sorted))
-	keepReasons[sorted[0].ID] = "oldest"
-	keepReasons[sorted[len(sorted)-1].ID] = "latest"
+	var healthy []kopia.Snapshot
+	for _, snapshot := range sorted {
+		if !snapshot.Healthy() {
+			keepReasons[snapshot.ID] = "incomplete, errored, or unverified"
+			continue
+		}
+		healthy = append(healthy, snapshot)
+	}
+	if len(healthy) == 0 {
+		var result Result
+		for _, snapshot := range sorted {
+			result.Kept = append(result.Kept, Decision{Snapshot: snapshot, Reason: keepReasons[snapshot.ID]})
+		}
+		return result
+	}
+	keepReasons[healthy[0].ID] = "oldest complete"
+	keepReasons[healthy[len(healthy)-1].ID] = "latest complete"
 
 	keepLatest := options.KeepLatest
 	if keepLatest < 1 {
 		keepLatest = 1
 	}
 
-	start := len(sorted) - keepLatest
+	start := len(healthy) - keepLatest
 	if start < 0 {
 		start = 0
 	}
 
-	for i := start; i < len(sorted); i++ {
-		if _, ok := keepReasons[sorted[i].ID]; !ok {
-			keepReasons[sorted[i].ID] = "keep-latest window"
+	for i := start; i < len(healthy); i++ {
+		if _, ok := keepReasons[healthy[i].ID]; !ok {
+			keepReasons[healthy[i].ID] = "keep-latest complete window"
 		}
 	}
 
 	for _, snapshot := range sorted {
+		if len(snapshot.Pins) > 0 {
+			keepReasons[snapshot.ID] = "pinned"
+			continue
+		}
 		if len(snapshot.RetentionReasons) > 0 {
 			keepReasons[snapshot.ID] = "retention-protected"
 			continue
@@ -72,7 +94,7 @@ func BuildPlan(snapshots []kopia.Snapshot, options Options) Result {
 		}
 	}
 
-	latestTime := sorted[len(sorted)-1].EndTime
+	latestTime := healthy[len(healthy)-1].EndTime
 	bucketChoices := map[int]candidateChoice{}
 	for index, snapshot := range sorted {
 		if _, kept := keepReasons[snapshot.ID]; kept {
@@ -81,6 +103,7 @@ func BuildPlan(snapshots []kopia.Snapshot, options Options) Result {
 
 		age := latestTime.Sub(snapshot.EndTime)
 		if age <= 0 {
+			keepReasons[snapshot.ID] = "latest timestamp tie"
 			continue
 		}
 
@@ -128,7 +151,7 @@ func matchesProtectedTag(tags map[string]string, protected []string) bool {
 			continue
 		}
 
-		if tags[parts[0]] == parts[1] {
+		if value, exists := tags[parts[0]]; exists && value == parts[1] {
 			return true
 		}
 	}
